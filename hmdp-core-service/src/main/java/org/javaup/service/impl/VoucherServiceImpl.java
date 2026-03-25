@@ -278,7 +278,6 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
                 userIdStr
         ));
 
-
         RedisKeyBuild statusKey = RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_SUBSCRIBE_STATUS_TAG_KEY, voucherId);
         if (purchased) {
             redisCache.putHash(statusKey, userIdStr, SubscribeStatus.SUCCESS.getCode(), ttlSeconds, TimeUnit.SECONDS);

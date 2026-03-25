@@ -588,9 +588,27 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         return null;
     }
     
+    /**
+     * 取消秒杀优惠券订单
+     * 
+     * 业务流程：
+     * 1. 验证订单是否存在且状态正常
+     * 2. 更新订单状态为已取消
+     * 3. 恢复秒杀库存（+1）
+     * 4. 记录对账日志
+     * 5. 回滚 Redis 中的库存数据
+     * 6. 清理用户订阅状态
+     * 7. 扣减店铺买家排行榜数据
+     * 8. 自动发券给候补队列中的下一个用户
+     *
+     * @param cancelVoucherOrderDto 取消订单请求参数（包含 voucherId）
+     * @return Boolean 取消成功返回 true，失败返回 false
+     * @throws HmdpFrameException 当订单不存在或优惠券不存在时抛出异常
+     */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public Boolean cancel(CancelVoucherOrderDto cancelVoucherOrderDto) {
+        // 1. 查询待取消的订单（必须是当前用户的、未使用的订单）
         VoucherOrder voucherOrder = lambdaQuery()
                 .eq(VoucherOrder::getUserId, UserHolder.getUser().getId())
                 .eq(VoucherOrder::getVoucherId, cancelVoucherOrderDto.getVoucherId())
@@ -599,35 +617,48 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (Objects.isNull(voucherOrder)) {
             throw new HmdpFrameException(BaseCode.SECKILL_VOUCHER_ORDER_NOT_EXIST);
         }
+        
+        // 2. 查询秒杀优惠券信息，用于后续库存恢复
         SeckillVoucher seckillVoucher = seckillVoucherService.lambdaQuery()
                 .eq(SeckillVoucher::getVoucherId, cancelVoucherOrderDto.getVoucherId())
                 .one();
         if (Objects.isNull(seckillVoucher)) {
             throw new HmdpFrameException(BaseCode.SECKILL_VOUCHER_NOT_EXIST);
         }
+        
+        // 3. 更新订单状态为已取消
         boolean updateResult = lambdaUpdate().set(VoucherOrder::getStatus, OrderStatus.CANCEL.getCode())
                 .set(VoucherOrder::getUpdateTime, LocalDateTimeUtil.now())
                 .eq(VoucherOrder::getUserId, UserHolder.getUser().getId())
                 .eq(VoucherOrder::getVoucherId, cancelVoucherOrderDto.getVoucherId())
                 .update();
+        
+        // 4. 生成全局唯一追踪 ID，用于链路追踪和对账
         long traceId = snowflakeIdGenerator.nextId();
+        
+        // 5. 构建对账日志 DTO，记录库存恢复详情
         VoucherReconcileLogDto voucherReconcileLogDto = new VoucherReconcileLogDto();
         voucherReconcileLogDto.setOrderId(voucherOrder.getId());
         voucherReconcileLogDto.setUserId(voucherOrder.getUserId());
         voucherReconcileLogDto.setVoucherId(voucherOrder.getVoucherId());
         voucherReconcileLogDto.setDetail("cancel voucher order ");
-        voucherReconcileLogDto.setBeforeQty(seckillVoucher.getStock());
-        voucherReconcileLogDto.setChangeQty(1);
-        voucherReconcileLogDto.setAfterQty(seckillVoucher.getStock() + 1);
+        voucherReconcileLogDto.setBeforeQty(seckillVoucher.getStock());  // 恢复前库存
+        voucherReconcileLogDto.setChangeQty(1);                          // 变化量（+1）
+        voucherReconcileLogDto.setAfterQty(seckillVoucher.getStock() + 1); // 恢复后库存
         voucherReconcileLogDto.setTraceId(traceId);
-        voucherReconcileLogDto.setLogType(LogType.RESTORE.getCode());
-        voucherReconcileLogDto.setBusinessType( BusinessType.CANCEL.getCode());
+        voucherReconcileLogDto.setLogType(LogType.RESTORE.getCode());      // 日志类型：库存恢复
+        voucherReconcileLogDto.setBusinessType( BusinessType.CANCEL.getCode()); // 业务类型：取消订单
+        
+        // 6. 保存对账日志到数据库
         boolean saveReconcileLogResult = voucherReconcileLogService.saveReconcileLog(voucherReconcileLogDto);
         
+        // 7. 恢复秒杀库存（stock + 1）
         boolean rollbackStockResult = seckillVoucherService.rollbackStock(cancelVoucherOrderDto.getVoucherId());
         
+        // 8. 汇总所有操作结果
         Boolean result = updateResult && saveReconcileLogResult && rollbackStockResult;
         if (result) {
+            // 9. 回滚 Redis 中的库存数据（Lua 脚本保证原子性）
             redisVoucherData.rollbackRedisVoucherData(
                     SeckillVoucherOrderOperate.YES,
                     traceId,
@@ -638,47 +669,82 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     1,
                     seckillVoucher.getStock() + 1
             );
+            
+            // 10. 删除用户的订阅状态缓存
             redisCache.delForHash(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_SUBSCRIBE_STATUS_TAG_KEY, 
                     cancelVoucherOrderDto.getVoucherId()),
                     String.valueOf(voucherOrder.getUserId()));
+            
+            // 11. 获取优惠券信息，用于处理店铺排行榜
             Voucher voucher = voucherService.getById(voucherOrder.getVoucherId());
             if (Objects.nonNull(voucher)) {
+                // 格式化日期为 yyyyMMdd 格式
                 String day = voucherOrder.getCreateTime().format(DateTimeFormatter.BASIC_ISO_DATE);
+                // 构建店铺日榜 Redis Key
                 RedisKeyBuild dailyKey = RedisKeyBuild.createRedisKey(
                         RedisKeyManage.SECKILL_SHOP_TOP_BUYERS_DAILY_TAG_KEY,
                         voucher.getShopId(),
                         day
                 );
+                // 扣减用户在店铺日榜中的购买次数（-1）
                 redisCache.incrementScoreForSortedSet(dailyKey, String.valueOf(voucherOrder.getUserId()), -1.0);
             }
             
+            // 12. 尝试自动发券给候补队列中的下一个用户（异步非阻塞）
             try {
                 autoIssueVoucherToEarliestSubscriber(
                         voucherOrder.getVoucherId(), 
                         voucherOrder.getUserId()
                 );
             } catch (Exception e) {
+                // 发券失败不影响主流程，仅记录警告日志
                 log.warn("自动发券失败，voucherId={}, err=\n{}", voucherOrder.getVoucherId(), e.getMessage());
             }
         }
         return result;
     }
     
+    /**
+     * 自动发券给候补队列中最早的订阅用户
+     * 
+     * 业务场景：
+     * 当有用户取消订单后，系统自动将释放的库存发放给候补队列中的下一个用户，
+     * 提高秒杀券的利用率，减少用户等待时间。
+     * 
+     * 核心流程：
+     * 1. 查询秒杀优惠券的完整信息（包括库存、时间等）
+     * 2. 验证优惠券是否存在且在有效期内
+     * 3. 加载库存信息到 Redis
+     * 4. 从候补队列中查找最早的候选用户
+     * 5. 向候选用户发券
+     *
+     * @param voucherId 优惠券 ID
+     * @param excludeUserId 排除的用户 ID（通常是取消订单的用户，避免重复发券）
+     * @return boolean 发券成功返回 true，失败返回 false（无候补用户、库存不足等情况）
+     */
     @Override
     public boolean autoIssueVoucherToEarliestSubscriber(final Long voucherId, final Long excludeUserId) {
+        // 1. 查询秒杀优惠券的完整模型（包含库存、时间等全量信息）
         SeckillVoucherFullModel seckillVoucherFullModel = seckillVoucherService.queryByVoucherId(voucherId);
         if (Objects.isNull(seckillVoucherFullModel) 
-                || 
-                Objects.isNull(seckillVoucherFullModel.getBeginTime()) 
-                ||
-                Objects.isNull(seckillVoucherFullModel.getEndTime())) {
+                || Objects.isNull(seckillVoucherFullModel.getBeginTime()) 
+                || Objects.isNull(seckillVoucherFullModel.getEndTime())) {
+            // 优惠券不存在或时间信息不完整，无法发券
             return false;
         }
+        
+        // 2. 加载库存信息到 Redis 缓存（为后续 Lua 脚本做准备）
         seckillVoucherService.loadVoucherStock(voucherId);
+        
+        // 3. 从候补队列中查找最早的候选用户（排除指定用户）
+        // 候补队列基于 Redis ZSET 实现，score 为订阅时间戳，按时间顺序排队
         String candidateUserIdStr = findEarliestCandidate(voucherId, excludeUserId);
         if (StrUtil.isBlank(candidateUserIdStr)) {
+            // 没有符合条件的候补用户
             return false;
         }
+        
+        // 4. 向候选用户发放优惠券（包含库存扣减、订单创建等操作）
         return issueToCandidate(voucherId, candidateUserIdStr, seckillVoucherFullModel);
     }
     
@@ -788,147 +854,4 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         long secondsUntilEnd = Duration.between(LocalDateTimeUtil.now(), seckillVoucherFullModel.getEndTime()).getSeconds();
         return Math.max(1L, secondsUntilEnd + Duration.ofDays(1).getSeconds());
     }
-
-    /*
-    private BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
-    private class VoucherOrderHandler implements Runnable{
-        @Override
-        public void run() {
-            while (true){
-                try {
-                    // 1.获取队列中的订单信息
-                    VoucherOrder voucherOrder = orderTasks.take();
-                    // 2.创建订单
-                    handleVoucherOrder(voucherOrder);
-                } catch (Exception e) {
-                    log.error("处理订单异常", e);
-                }
-            }
-        }
-    }
-     */
-
-    /*
-    redis+Lua脚本 + 异步下单
-     */
-    /*
-    @Override
-    public Result seckillVoucher(Long voucherId) {
-        Long userId = UserHolder.getUser().getId();
-        // 1.执行lua脚本
-        Long result = stringRedisTemplate.execute(
-                SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(), userId.toString()
-        );
-        int r = result.intValue();
-        // 2.判断结果是否为0
-        if (r != 0) {
-            // 2.1.不为0 ，代表没有购买资格
-            return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
-        }
-        // 2.2.为0 ，有购买资格，把下单信息保存到阻塞队列
-        VoucherOrder voucherOrder = new VoucherOrder();
-        // 2.3.订单id
-        long orderId = redisIdWorker.nextId("order");
-        voucherOrder.setId(orderId);
-        // 2.4.用户id
-        voucherOrder.setUserId(userId);
-        // 2.5.代金券id
-        voucherOrder.setVoucherId(voucherId);
-        // 2.6.放入阻塞队列
-        orderTasks.add(voucherOrder);
-        // 3.获取代理对象
-        proxy = (IVoucherOrderService) AopContext.currentProxy()
-        // 4.返回订单id
-        return Result.ok(orderId);
-    }*/
-
-    /*
-    分布式锁/单机锁 + 异步下单
-     */
-    /*@Override
-    public Result seckillVoucher(Long voucherId) {
-        // 1.查询优惠券
-        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-        // 2.判断秒杀是否开始
-        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
-            // 尚未开始
-            return Result.fail("秒杀尚未开始！");
-        }
-        // 3.判断秒杀是否已经结束
-        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
-            // 尚未开始
-            return Result.fail("秒杀已经结束！");
-        }
-        // 4.判断库存是否充足
-        if (voucher.getStock() < 1) {
-            // 库存不足
-            return Result.fail("库存不足！");
-        }
-
-        Long userId = UserHolder.getUser().getId();
-        // 创建锁对象
-        // SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
-        RLock lock = redissonClient.getLock("lock:order:" + userId);
-        // 获取锁
-        boolean isLock = lock.tryLock();
-        // 判断是否获取锁成功
-        if(!isLock){
-            // 获取锁失败，返回错误或重试
-            return Result.fail("不允许重复下单");
-        }
-        try {
-            // 获取代理对象（事务）
-            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-            return proxy.createVoucherOrder(voucherId);
-        } finally {
-            // 释放锁
-            lock.unlock();
-        }
-    }*/
-
-   /*
-   数据库乐观锁 + 同步下单 解决超卖
-    */
-    /*@Transactional
-    public Result createVoucherOrder(Long voucherId) {
-        // 5.一人一单
-        Long userId = UserHolder.getUser().getId();
-
-        synchronized (userId.toString().intern()) {
-            // 5.1.查询订单
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
-            // 5.2.判断是否存在
-            if (count > 0) {
-                // 用户已经购买过了
-                return Result.fail("用户已经购买过一次！");
-            }
-
-            // 6.扣减库存
-            boolean success = seckillVoucherService.update()
-                    .setSql("stock = stock - 1") // set stock = stock - 1
-                    .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
-                    .update();
-            if (!success) {
-                // 扣减失败
-                return Result.fail("库存不足！");
-            }
-
-            // 7.创建订单
-            VoucherOrder voucherOrder = new VoucherOrder();
-            // 7.1.订单id
-            long orderId = redisIdWorker.nextId("order");
-            voucherOrder.setId(orderId);
-            // 7.2.用户id
-            voucherOrder.setUserId(userId);
-            // 7.3.代金券id
-            voucherOrder.setVoucherId(voucherId);
-            save(voucherOrder);
-
-            // 7.返回订单id
-            return Result.ok(orderId);
-        }
-    }*/
-
 }
