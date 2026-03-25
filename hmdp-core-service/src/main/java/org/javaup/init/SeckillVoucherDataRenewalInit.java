@@ -15,69 +15,43 @@ import java.util.List;
 
 /**
  * @program: 黑马点评-plus升级版实战项目。添加 阿星不是程序员 微信，添加时备注 点评 来获取项目的完整资料
- * @description: 秒杀优惠券数据重置-开始和结束时间
+ * @description: 秒杀优惠券数据重置-库存恢复
  * @author: 阿星不是程序员
+ *
+ * 说明：本类仅用于开发/测试环境，用于恢复秒杀券库存。
+ * 注意：已移除自动延长优惠券时间的功能，避免修改业务数据。
  **/
 @Slf4j
 @Order(2)
 @Component
 public class SeckillVoucherDataRenewalInit {
-    
+
     @Resource
     private ISeckillVoucherService seckillVoucherService;
-    
+
     @PostConstruct
     public void init(){
-        updateBeginAndEndTime();
-        //将库存数量恢复
-        //renewalStock();
+        // 自动延长优惠券时间的功能已移除，避免意外修改业务数据
+        // 如需恢复库存功能，可取消下面注释
+        // renewalStock();
     }
-    
-    public void updateBeginAndEndTime(){
-        log.info("==========更新优惠券的开始时间和结束时间==========");
-        //查询优惠券结束时间小于2天前的节目演出数据
-        List<SeckillVoucher> seckillVoucherList =
-                seckillVoucherService.lambdaQuery()
-                        .le(SeckillVoucher::getEndTime,
-                                LocalDateTimeUtil.offset(LocalDateTimeUtil.now(), 2, ChronoUnit.DAYS))
-                        .list();
-        for (SeckillVoucher seckillVoucher : seckillVoucherList) {
-            LocalDateTime oldBeginTime = seckillVoucher.getBeginTime();
-            LocalDateTime oldEndTime = seckillVoucher.getEndTime();
-            //将现有的开始时间加上15天作为新的开始时间
-            LocalDateTime newBeginTime = LocalDateTimeUtil.offset(oldBeginTime, 15, ChronoUnit.DAYS);
-            //将现有的结束时间加上15天作为新的结束时间
-            LocalDateTime newEndTime = LocalDateTimeUtil.offset(oldEndTime, 15, ChronoUnit.DAYS);
-            LocalDateTime nowTime = LocalDateTimeUtil.now();
-            //如果新的结束时间还是小于当前时间，则继续再1天，直到新的结束时间大于当前时间为止
-            while (newEndTime.isBefore(nowTime)) {
-                newBeginTime = LocalDateTimeUtil.offset(newBeginTime,1,ChronoUnit.DAYS);
-                newEndTime = LocalDateTimeUtil.offset(newEndTime,1,ChronoUnit.DAYS);
-            }
-            //执行更新
-            seckillVoucherService.lambdaUpdate()
-                    .set(SeckillVoucher::getBeginTime, newBeginTime)
-                    .set(SeckillVoucher::getEndTime, newEndTime)
-                    .set(SeckillVoucher::getUpdateTime,LocalDateTimeUtil.now())
-                    .eq(SeckillVoucher::getId,seckillVoucher.getId())
-                    .eq(SeckillVoucher::getVoucherId,seckillVoucher.getVoucherId())
-                    .update();
-        }
-    }
-    
+
+    /**
+     * 恢复秒杀券库存
+     * 将已售出的库存恢复到初始值，用于测试环境重复测试
+     */
     public void renewalStock(){
         log.info("==========将优惠券的库存数量恢复==========");
-        //将库存数量恢复
         List<SeckillVoucher> seckillVoucherList = seckillVoucherService.list();
         for (SeckillVoucher seckillVoucher : seckillVoucherList) {
             if (!seckillVoucher.getInitStock().equals(seckillVoucher.getStock())) {
-                //执行更新
                 seckillVoucherService.lambdaUpdate()
                         .set(SeckillVoucher::getStock,seckillVoucher.getInitStock())
                         .set(SeckillVoucher::getUpdateTime,LocalDateTimeUtil.now())
                         .eq(SeckillVoucher::getId,seckillVoucher.getId())
                         .eq(SeckillVoucher::getVoucherId,seckillVoucher.getVoucherId())
                         .update();
+                log.info("恢复库存成功，voucherId={}，stock={}", seckillVoucher.getVoucherId(), seckillVoucher.getInitStock());
             }
         }
     }
