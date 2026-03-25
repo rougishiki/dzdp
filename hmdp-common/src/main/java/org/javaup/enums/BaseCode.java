@@ -14,7 +14,7 @@ public enum BaseCode {
     SUCCESS(0, "OK"),
     
     SECKILL_VOUCHER_NOT_EXIST(10001, "秒杀优惠券不存在"),
-    
+
     SECKILL_VOUCHER_NOT_BEGIN(10002, "秒杀优惠券未开始"),
     
     SECKILL_VOUCHER_IS_OVER(10003, "秒杀优惠券已结束"),
@@ -44,6 +44,8 @@ public enum BaseCode {
     USER_NOT_EXIST(20000, "用户不存在"),
     
     USER_ALREADY_PURCHASE(20001, "用户已经购买"),
+
+    VOUCHER_NOT_EXIST(20002, "优惠券不存在")
     ;
     
     @Getter

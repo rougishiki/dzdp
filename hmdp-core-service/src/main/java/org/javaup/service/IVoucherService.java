@@ -40,4 +40,6 @@ public interface IVoucherService extends IService<Voucher> {
     List<GetSubscribeStatusVo> getSubscribeStatusBatch(VoucherSubscribeBatchDto voucherSubscribeBatchDto);
     
     void delayVoucherReminder(DelayVoucherReminderDto delayVoucherReminderDto);
+    
+    void deleteVoucher(Long voucherId);
 }

@@ -172,4 +172,17 @@ public class VoucherController {
         voucherService.delayVoucherReminder(delayVoucherReminderDto);
         return Result.ok();
     }
+    
+    /**
+     * 删除优惠券（自动判断是普通券还是秒杀券）
+     * 
+     * @param getSeckillVoucherDto 删除参数，包含优惠券 ID
+     * @return 无返回值
+     */
+    @PostMapping("/delete")
+    public Result<Void> deleteVoucher(@Valid @RequestBody GetSeckillVoucherDto getSeckillVoucherDto){
+        // 删除优惠券（自动判断类型：普通券只删数据库，秒杀券同时清理 Redis 缓存）
+        voucherService.deleteVoucher(getSeckillVoucherDto.getVoucherId());
+        return Result.ok();
+    }
 }

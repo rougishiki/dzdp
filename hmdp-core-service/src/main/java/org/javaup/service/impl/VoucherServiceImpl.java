@@ -543,4 +543,54 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         delayQueueContext.sendMessage(topic, content, delayVoucherReminderDto.getDelaySeconds(), TimeUnit.SECONDS);
         log.info("[测试延迟发送] 已调度提醒消息 voucherId={} delaySeconds={} topic={}", seckillVoucher.getVoucherId(), delaySeconds, topic);
     }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void deleteVoucher(Long voucherId) {
+        // 1. 查询优惠券是否存在
+        Voucher voucher = this.lambdaQuery().eq(Voucher::getId, voucherId).one();
+        if (Objects.isNull(voucher)) {
+            throw new HmdpFrameException(BaseCode.VOUCHER_NOT_EXIST);
+        }
+
+        // 2. 判断是否为秒杀券（查询 seckill_voucher 表）
+        SeckillVoucher seckillVoucher = seckillVoucherService.lambdaQuery()
+                .eq(SeckillVoucher::getVoucherId, voucherId)
+                .one();
+
+        if (Objects.nonNull(seckillVoucher)) {
+            // 2.1 是秒杀券，先删除秒杀券信息
+            seckillVoucherService.lambdaUpdate()
+                    .eq(SeckillVoucher::getVoucherId, voucherId)
+                    .remove();
+
+            // 2.2 删除 Redis 中的秒杀券相关缓存
+            // 删除秒杀优惠券信息缓存
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_VOUCHER_TAG_KEY, voucherId));
+            // 删除空值缓存（防缓存穿透）
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_VOUCHER_NULL_TAG_KEY, voucherId));
+            // 删除库存缓存
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_STOCK_TAG_KEY, voucherId));
+            // 删除已购用户集合
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_USER_TAG_KEY, voucherId));
+            // 删除订阅用户集合
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_SUBSCRIBE_USER_TAG_KEY, voucherId));
+            // 删除订阅队列（ZSET）
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_SUBSCRIBE_ZSET_TAG_KEY, voucherId));
+            // 删除订阅状态 HASH
+            redisCache.del(RedisKeyBuild.createRedisKey(RedisKeyManage.SECKILL_SUBSCRIBE_STATUS_TAG_KEY, voucherId));
+
+            // 2.3 发送缓存失效通知（集群环境下同步其他节点的本地缓存）
+            seckillVoucherCacheInvalidationPublisher.publishInvalidate(voucherId, "delete");
+
+            log.info("删除秒杀券成功，voucherId={}", voucherId);
+        } else {
+            log.info("删除普通优惠券成功，voucherId={}", voucherId);
+        }
+
+        // 3. 删除优惠券主表信息（普通券和秒杀券都需要删除）
+        this.lambdaUpdate()
+                .eq(Voucher::getId, voucherId)
+                .remove();
+    }
 }
